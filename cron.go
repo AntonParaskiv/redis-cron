@@ -1,6 +1,7 @@
 package cron
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"log"
@@ -182,10 +183,6 @@ func (c *Cron) Start() {
 	if c.running {
 		return
 	}
-	if err := c.clear(); err != nil {
-		c.logf("cron: panic clear job keys: %v", err)
-		return
-	}
 
 	c.running = true
 	go c.run()
@@ -194,10 +191,6 @@ func (c *Cron) Start() {
 // Run the cron scheduler, or no-op if already running.
 func (c *Cron) Run() {
 	if c.running {
-		return
-	}
-	if err := c.clear(); err != nil {
-		c.logf("cron: panic clear job keys: %v", err)
 		return
 	}
 
@@ -226,20 +219,38 @@ func (c *Cron) clear() error {
 }
 
 func (c *Cron) lock(conn redis.Conn, jobKey string, start time.Time, next time.Time) (bool, error) {
-	expireAfter := c.calcExpiry(start.In(c.location), next.In(c.location))
-	reply, err := redis.String(conn.Do("SET", jobKey, 1, "NX", "PX", int(expireAfter)))
-	if reply != "OK" || err != nil {
+	expireAfter := c.calcExpiry(start.In(c.location), next.In(c.location)).Milliseconds()
+	locked, err := c.setNxPxExpire(conn, jobKey, expireAfter)
+	if !locked || err != nil {
 		return false, err
 	}
-	return c.jobStart(conn, jobKey)
+	if c.noRepeat {
+		locked, err = c.setNxPxExpire(conn, jobRunningKey(jobKey), expireAfter)
+		if !locked || err != nil {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
-func (c *Cron) jobStart(conn redis.Conn, jobKey string) (bool, error) {
-	if !c.noRepeat {
-		return true, nil
+func (c *Cron) setNxPxExpire(conn redis.Conn, jobKey string, expireAfter int64) (bool, error) {
+	reply, err := redis.String(conn.Do("SET", jobKey, 1, "NX", "PX", int(expireAfter)))
+	if reply != "OK" || err != nil {
+		//fmt.Println("lock failed", jobKey, int(expireAfter))
+		return false, err
 	}
-	reply, err := redis.String(conn.Do("SET", jobRunningKey(jobKey), 1, "NX"))
-	return reply == "OK" && err == nil, err
+	//fmt.Println("locked", jobKey, expireAfter)
+	return true, nil
+}
+
+func (c *Cron) setNxXxExpire(conn redis.Conn, jobKey string, expireAfter int64) (bool, error) {
+	reply, err := redis.String(conn.Do("SET", jobKey, 1, "XX", "PX", int(expireAfter)))
+	if reply != "OK" || err != nil {
+		//fmt.Println("updated lock failed", jobKey, int(expireAfter))
+		return false, err
+	}
+	//fmt.Println("updated lock", jobKey, int(expireAfter))
+	return true, nil
 }
 
 func (c *Cron) jobEnd(conn redis.Conn, jobKey string) error {
@@ -251,11 +262,8 @@ func (c *Cron) jobEnd(conn redis.Conn, jobKey string) error {
 }
 
 // in millisecond
-func (c *Cron) calcExpiry(now time.Time, next time.Time) int64 {
-	nowUnix := now.UnixNano()
-	nextUnix := next.UnixNano()
-	expiry := ((nextUnix - nowUnix) / 2) / 1e6
-	return expiry
+func (c *Cron) calcExpiry(now time.Time, next time.Time) time.Duration {
+	return next.Sub(now) / 2
 }
 
 func (c *Cron) constructKey(entry *Entry) string {
@@ -273,24 +281,53 @@ func (c *Cron) runWithRecovery(e *Entry, start time.Time, next time.Time) {
 		c.logf("cron: %v", err)
 		return
 	}
+
+	updateExpireCtx, cancel := context.WithCancel(context.Background())
+
 	defer func() {
+		cancel()
+
 		// end job when locked success
 		if locked {
 			if err := c.jobEnd(conn, jobKey); err != nil {
 				c.logf("cron: %v", err)
 			}
 		}
-		conn.Close()
 		if r := recover(); r != nil {
 			const size = 64 << 10
 			buf := make([]byte, size)
 			buf = buf[:runtime.Stack(buf, false)]
 			c.logf("cron: panic running job: %v\n%s", r, buf)
+
+			if err = c.jobEnd(conn, jobKey); err != nil {
+				c.logf("cron: %v", err)
+			}
 		}
+		conn.Close()
 	}()
 	if !locked {
 		return
 	}
+
+	if c.noRepeat {
+		go func() {
+			expire := c.calcExpiry(start.In(c.location), next.In(c.location))
+			expireAfter := expire.Milliseconds()
+
+			ticker := time.NewTicker(expire / 2)
+			for {
+				select {
+				case <-ticker.C:
+					//fmt.Println("ticker triggered")
+					c.setNxXxExpire(conn, jobRunningKey(jobKey), expireAfter)
+				case <-updateExpireCtx.Done():
+					//fmt.Println("context done")
+					return
+				}
+			}
+		}()
+	}
+
 	e.Job.Run()
 }
 
@@ -365,9 +402,6 @@ func (c *Cron) logf(format string, args ...interface{}) {
 func (c *Cron) Stop() {
 	if !c.running {
 		return
-	}
-	if err := c.clear(); err != nil {
-		c.logf("cron: panic clear job keys: %v", err)
 	}
 	c.stop <- struct{}{}
 	c.running = false
